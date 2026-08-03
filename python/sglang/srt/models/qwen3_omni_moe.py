@@ -111,14 +111,14 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             config.encoder_ffn_dim,
             quant_config=quant_config,
             bias=True,
-            prefix=f"{prefix}.fc1",
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = fc2_cls(
             config.encoder_ffn_dim,
             self.embed_dim,
             quant_config=quant_config,
             bias=True,
-            prefix=f"{prefix}.fc2",
+            prefix=add_prefix("fc2", prefix),
         )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
@@ -200,7 +200,12 @@ def _get_feat_extract_output_lengths(input_lengths):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeAudioEncoderConfig,
+        quant_config=None,
+        prefix: str = "",
+    ):
         super().__init__(config)
         self.dropout = config.dropout
 
@@ -214,8 +219,12 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniMoeAudioEncoderLayer(config)
-                for _ in range(config.encoder_layers)
+                Qwen3OmniMoeAudioEncoderLayer(
+                    config,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                )
+                for layer_idx in range(config.encoder_layers)
             ]
         )
         self.ln_post = nn.LayerNorm(config.d_model)
@@ -243,13 +252,20 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             config.d_model,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("conv_out", prefix),
         )
         self.proj1 = ReplicatedLinear(
-            config.d_model, config.d_model, quant_config=quant_config
+            config.d_model,
+            config.d_model,
+            quant_config=quant_config,
+            prefix=add_prefix("proj1", prefix),
         )
         self.act = ACT2FN[config.activation_function]
         self.proj2 = ReplicatedLinear(
-            config.d_model, config.output_dim, quant_config=quant_config
+            config.d_model,
+            config.output_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("proj2", prefix),
         )
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
@@ -440,10 +456,13 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
         prefix: str = None,
         **kwargs,
     ):
+        norm_eps = kwargs.pop("norm_eps", getattr(config, "rms_norm_eps", 1e-6))
         super().__init__(
             vision_config=config,
             quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            norm_eps=norm_eps,
+            prefix=prefix or "",
+            **kwargs,
         )
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
@@ -462,9 +481,9 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
                     spatial_merge_size=config.spatial_merge_size,
                     use_postshuffle_norm=True,
                     quant_config=quant_config,
-                    prefix=add_prefix("merger_list", prefix),
+                    prefix=add_prefix(f"merger_list.{layer_idx}", prefix),
                 )
-                for _ in range(len(config.deepstack_visual_indexes))
+                for layer_idx in range(len(config.deepstack_visual_indexes))
             ]
         )
         del self.deepstack_merger_list
@@ -494,7 +513,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            config.audio_config,
+            quant_config=quant_config,
+            prefix=add_prefix("audio_tower", prefix),
+        )
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
             quant_config=quant_config,
@@ -550,7 +573,9 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.config = config
 
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
-            config.thinker_config, quant_config=quant_config, prefix=prefix
+            config.thinker_config,
+            quant_config=quant_config,
+            prefix=add_prefix("thinker", prefix),
         )
         self.enable_talker = False
         self.pad_input_ids = self.thinker.pad_input_ids
@@ -638,7 +663,10 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    weight_loader(param, loaded_weight, shard_id)
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to load checkpoint tensor {name}") from exc
                 break
             else:
                 # Track if this is an expert weight to enable early skipping
@@ -687,6 +715,10 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                             and name_mapped not in params_dict
                         ):
                             continue
+                        if name_mapped not in params_dict and name_mapped.endswith(
+                            "_weight_packed"
+                        ):
+                            name_mapped = name_mapped[: -len("_packed")]
                         if name_mapped in params_dict.keys():
                             param = params_dict[name_mapped]
                         else:
@@ -723,7 +755,12 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        weight_loader(param, loaded_weight)
+                        try:
+                            weight_loader(param, loaded_weight)
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"Failed to load checkpoint tensor {name}"
+                            ) from exc
                     else:
                         logger.warning(
                             f"Loaded weight with {name=} not found in params_dict"

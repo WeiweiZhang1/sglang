@@ -43,9 +43,12 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4MxFp4MoE,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
+    CompressedTensorsW8A8MxFp8,
+    CompressedTensorsW8A8MxFp8MoE,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
@@ -436,6 +439,60 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
 
+    def _is_mxfp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_float_type = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_grouped_mxfp8 = (
+            weight_quant.num_bits == 8
+            and input_quant.num_bits == 8
+            and weight_quant.strategy == QuantizationStrategy.GROUP
+            and input_quant.strategy == QuantizationStrategy.GROUP
+            and weight_quant.group_size == 32
+            and input_quant.group_size == 32
+        )
+        is_dynamic_w8a8 = not weight_quant.dynamic and input_quant.dynamic
+        return (
+            is_float_type
+            and is_grouped_mxfp8
+            and is_dynamic_w8a8
+            and weight_quant.symmetric
+            and input_quant.symmetric
+        )
+
+    def _is_mxfp4_w4a4(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_float_type = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_grouped_mxfp4 = (
+            weight_quant.num_bits == 4
+            and input_quant.num_bits == 4
+            and weight_quant.strategy == QuantizationStrategy.GROUP
+            and input_quant.strategy == QuantizationStrategy.GROUP
+            and weight_quant.group_size == 32
+            and input_quant.group_size == 32
+        )
+        return (
+            is_float_type
+            and is_grouped_mxfp4
+            and not weight_quant.dynamic
+            and input_quant.dynamic
+            and weight_quant.symmetric
+            and input_quant.symmetric
+        )
+
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights quantized.
         if weight_quant is None:
@@ -565,6 +622,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
         if is_activation_quantization_format(self.quant_format):
+            if self._is_mxfp8_w8a8(weight_quant, input_quant):
+                is_mxfp8_supported = self._check_scheme_supported(
+                    CompressedTensorsW8A8MxFp8.get_min_capability(), error=False
+                )
+                if is_mxfp8_supported:
+                    return CompressedTensorsW8A8MxFp8()
+                raise NotImplementedError(
+                    "Current platform does not support MXFP8 compressed-tensors "
+                    "dense linear quantization. CUDA support requires SM100/SM120."
+                )
+
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -703,6 +771,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_mxfp4_w4a4(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW4A4MxFp4MoE")
+            return CompressedTensorsW4A4MxFp4MoE(prefix=layer_name or "")
+        elif self._is_mxfp8_w8a8(weight_quant, input_quant):
+            is_mxfp8_supported = self._check_scheme_supported(
+                CompressedTensorsW8A8MxFp8MoE.get_min_capability(), error=False
+            )
+            if not is_mxfp8_supported:
+                raise NotImplementedError(
+                    "Current platform does not support MXFP8 compressed-tensors "
+                    "MoE quantization. CUDA support requires SM100/SM120."
+                )
+            logger.info_once("Using CompressedTensorsW8A8MxFp8MoE")
+            return CompressedTensorsW8A8MxFp8MoE()
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

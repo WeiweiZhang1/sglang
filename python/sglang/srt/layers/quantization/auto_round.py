@@ -25,9 +25,16 @@ class AutoRoundConfig(QuantizationConfig):
     """
 
     SUPPORTED_BITS = {2, 3, 4, 8}
-    SUPPORTED_DTYPES = {"int"}
+    SUPPORTED_DTYPES = {"int", "mx_fp", "mxfp4", "mxfp8"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq"}
-    SUPPORTED_BACKENDS = {"auto", "gptq", "gptq:marlin", "awq", "awq:marlin", "marlin"}
+    SUPPORTED_BACKENDS = {
+        "auto",
+        "gptq",
+        "gptq:marlin",
+        "awq",
+        "awq:marlin",
+        "marlin",
+    }
 
     def __init__(
         self,
@@ -419,8 +426,54 @@ class AutoRoundConfig(QuantizationConfig):
 
         return None
 
+    def apply_mxfp_quant_layer(self, layer, prefix: str):
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedFusedMoEMethod,
+            UnquantizedLinearMethod,
+        )
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        weight_bits, _, _ = self.get_layer_config(layer, prefix)
+        if not self.check_quantized(weight_bits):
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return UnquantizedLinearMethod()
+            if isinstance(layer, FusedMoE):
+                return UnquantizedFusedMoEMethod()
+            return None
+
+        data_type = self.data_type.lower()
+        if "mxfp4" in data_type or (data_type == "mx_fp" and weight_bits == 4):
+            if not isinstance(layer, FusedMoE):
+                raise ValueError(
+                    "AutoRound MXFP4 support is limited to MoE experts. "
+                    f"Layer {prefix!r} ({layer.__class__.__name__}) is not a FusedMoE."
+                )
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+
+            return Mxfp4Config.from_config({"quant_method": "mxfp4"}).get_quant_method(
+                layer, prefix
+            )
+
+        if "mxfp8" in data_type or (data_type == "mx_fp" and weight_bits == 8):
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            return Fp8Config.from_config(
+                {
+                    "quant_method": "mxfp8",
+                    "activation_scheme": "dynamic",
+                }
+            ).get_quant_method(layer, prefix)
+
+        raise ValueError(
+            f"Unsupported AutoRound MX data_type={self.data_type!r} "
+            f"with bits={weight_bits} for layer {prefix!r}."
+        )
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        # TODO enable CPU quant method later
+        if "mxfp" in self.data_type.lower() or self.data_type.lower() == "mx_fp":
+            return self.apply_mxfp_quant_layer(layer, prefix)
         if "gptq" in self.packing_format or "gptq" in self.backend:
             return self.apply_gptq_quant_layer(layer, prefix)
         if "awq" in self.packing_format or "awq" in self.backend:
